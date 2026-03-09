@@ -1,6 +1,13 @@
 # bnb-skills
 
-BNB Chain (BSC) wallet skill for [Pan Network](https://github.com/pan-network-labs). Provides CLI tools for wallet creation, BNB transfers, and smart contract interaction on BNB Chain.
+BNB Chain (BSC) skill packages for [Pan Network](https://github.com/pan-network-labs). Provides CLI tools for wallet operations, BNB transfers, smart contract interaction, and PANdoraBox mystery boxes.
+
+## Skills
+
+| Skill | Description |
+|-------|-------------|
+| [`bnb-wallet`](bnb-wallet/) | Wallet creation, BNB transfers, smart contract calls |
+| [`pandora-box`](pandora-box/) | PANdoraBox mystery box — open boxes on-chain |
 
 ## Quick Start
 
@@ -59,13 +66,24 @@ python3 bnb-wallet/scripts/contract_call.py \
   --dry-run
 ```
 
-## Scripts
+### Open PANdoraBox
 
-| Script | Description |
-|--------|-------------|
-| `create_wallet.py` | Generate BSC wallets with optional mnemonic and encrypted keystore |
-| `transfer_bnb.py` | Transfer BNB with balance checks, gas estimation, and dry-run support |
-| `contract_call.py` | Read/write smart contract functions with automatic ABI type coercion |
+```bash
+# Dry run first
+python3 pandora-box/scripts/open_box.py \
+  --private-key $PRIVATE_KEY \
+  --tier 1 \
+  --contract 0xCONTRACT_ADDRESS \
+  --dry-run
+
+# Open 1 box (0.01 BNB)
+python3 pandora-box/scripts/open_box.py \
+  --private-key $PRIVATE_KEY \
+  --tier 1 \
+  --contract 0xCONTRACT_ADDRESS
+```
+
+**Tiers:** 1 (0.01 BNB) · 10 (0.1 BNB) · 100 (0.9 BNB, 10% off) · 1000 (8.4 BNB, 16% off) · 10000 (75 BNB, 25% off)
 
 ## Network Reference
 
