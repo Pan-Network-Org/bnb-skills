@@ -2,8 +2,14 @@
 """
 Open a PANdoraBox mystery box on BNB Chain.
 
+Full flow:
+  1. Connect to BSC & call openBox(tier) on-chain
+  2. POST /api/box/open — verify tx, draw rarity, create order + SBT
+  3. POST /api/generate-image — AI generates artwork, uploads to IPFS
+  4. POST /api/sbt/update-image — bind image to SBT
+
 Usage:
-    python3 open_box.py --private-key KEY --tier 1 [--contract ADDR] [--dry-run]
+    python3 open_box.py --private-key KEY --tier 1 [--dry-run]
 
 Tiers:
     1      = 0.01 BNB
@@ -16,6 +22,9 @@ Tiers:
 import argparse
 import json
 import sys
+import time
+import urllib.request
+import urllib.error
 
 try:
     from web3 import Web3
@@ -32,12 +41,15 @@ BSC_RPC_URLS = [
     "https://rpc.ankr.com/bsc",
 ]
 
-# Default PANdoraBox contract address (BSC mainnet)
-DEFAULT_CONTRACT = "0x0000000000000000000000000000000000000000"  # TODO: set deployed address
+# PANdoraBox contract (BSC mainnet)
+DEFAULT_CONTRACT = "0x1Fe618B20f5fa59211d41b7bd7Ca0161573D6DD0"
+
+# PANdora backend API
+DEFAULT_API_BASE = "https://pandora.pan.network"
 
 VALID_TIERS = [1, 10, 100, 1000, 10000]
 
-# Minimal ABI for openBox + view functions
+# Minimal ABI: openBox + getPrice + BoxOpened event
 PANDORA_BOX_ABI = json.loads("""[
     {
         "inputs": [{"name": "tier", "type": "uint256"}],
@@ -51,40 +63,6 @@ PANDORA_BOX_ABI = json.loads("""[
         "name": "getPrice",
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "pure",
-        "type": "function"
-    },
-    {
-        "inputs": [],
-        "name": "getStats",
-        "outputs": [
-            {"name": "_totalBoxesOpened", "type": "uint256"},
-            {"name": "_totalVolumeBNB", "type": "uint256"},
-            {"name": "_totalOrders", "type": "uint256"}
-        ],
-        "stateMutability": "view",
-        "type": "function"
-    },
-    {
-        "inputs": [{"name": "user", "type": "address"}],
-        "name": "getUserStats",
-        "outputs": [
-            {"name": "boxesOpened", "type": "uint256"},
-            {"name": "totalSpent", "type": "uint256"},
-            {"name": "orderCount", "type": "uint256"}
-        ],
-        "stateMutability": "view",
-        "type": "function"
-    },
-    {
-        "inputs": [{"name": "orderId", "type": "bytes32"}],
-        "name": "getOrder",
-        "outputs": [
-            {"name": "user", "type": "address"},
-            {"name": "tier", "type": "uint256"},
-            {"name": "amount", "type": "uint256"},
-            {"name": "timestamp", "type": "uint256"}
-        ],
-        "stateMutability": "view",
         "type": "function"
     },
     {
@@ -125,8 +103,30 @@ def normalize_key(key):
     return key
 
 
-def open_box(private_key, tier, contract_address, dry_run=False, api_url=None):
-    """Open a PANdoraBox mystery box."""
+def api_post(base_url, path, payload, timeout=120):
+    """POST JSON to backend API and return parsed response."""
+    url = f"{base_url}{path}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"[!] API error {e.code} on {path}: {body}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[!] API request failed on {path}: {e}", file=sys.stderr)
+        return None
+
+
+def open_box(private_key, tier, contract_address, api_base, dry_run=False):
+    """Open a PANdoraBox mystery box — full flow."""
     w3 = connect_bsc()
     chain_id = 56
 
@@ -144,7 +144,7 @@ def open_box(private_key, tier, contract_address, dry_run=False, api_url=None):
     price_wei = contract.functions.getPrice(tier).call()
     price_bnb = Web3.from_wei(price_wei, "ether")
     print(f"[+] Tier: {tier} boxes")
-    print(f"[+] Price: {price_bnb} BNB ({price_wei} wei)")
+    print(f"[+] Price: {price_bnb} BNB")
 
     # Check balance
     balance = w3.eth.get_balance(sender)
@@ -157,12 +157,11 @@ def open_box(private_key, tier, contract_address, dry_run=False, api_url=None):
 
     # Build transaction
     nonce = w3.eth.get_transaction_count(sender)
-
     tx = contract.functions.openBox(tier).build_transaction({
         "from": sender,
         "value": price_wei,
-        "gas": 300000,  # generous limit for openBox
-        "gasPrice": Web3.to_wei(3, "gwei"),  # BSC minimum
+        "gas": 300000,
+        "gasPrice": Web3.to_wei(3, "gwei"),
         "nonce": nonce,
         "chainId": chain_id,
     })
@@ -170,13 +169,12 @@ def open_box(private_key, tier, contract_address, dry_run=False, api_url=None):
     # Estimate gas
     try:
         estimated_gas = w3.eth.estimate_gas(tx)
-        tx["gas"] = int(estimated_gas * 1.2)  # 20% buffer
+        tx["gas"] = int(estimated_gas * 1.2)
         print(f"[+] Estimated gas: {estimated_gas} (using {tx['gas']})")
     except Exception as e:
         print(f"[!] Gas estimation failed, using default 300000: {e}")
 
-    total_cost_wei = price_wei + (tx["gas"] * tx["gasPrice"])
-    total_cost_bnb = Web3.from_wei(total_cost_wei, "ether")
+    total_cost_bnb = Web3.from_wei(price_wei + tx["gas"] * tx["gasPrice"], "ether")
 
     print(f"\n{'='*60}")
     print(f"  PANdoraBox - Open Mystery Box")
@@ -191,95 +189,155 @@ def open_box(private_key, tier, contract_address, dry_run=False, api_url=None):
 
     if dry_run:
         print(f"\n[DRY RUN] Transaction validated but NOT broadcast.")
-        print(f"[DRY RUN] Remove --dry-run to execute.")
         return None
 
-    # Sign and send
+    # ========== Step 1: On-chain transaction ==========
+    print(f"\n[Step 1/4] Sending on-chain transaction...")
     signed_tx = account.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-    tx_hash_hex = tx_hash.hex()
-    print(f"\n[+] Transaction sent: 0x{tx_hash_hex}")
-    print(f"[+] BSCScan: https://bscscan.com/tx/0x{tx_hash_hex}")
+    tx_hash_hex = f"0x{tx_hash.hex()}"
+    print(f"[+] TX sent: {tx_hash_hex}")
+    print(f"[+] BSCScan: https://bscscan.com/tx/{tx_hash_hex}")
 
-    # Wait for receipt
     print("[+] Waiting for confirmation...")
     try:
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
     except Exception as e:
-        print(f"\n[!] Timeout waiting for receipt: {e}", file=sys.stderr)
-        print(f"[!] Check manually: https://bscscan.com/tx/0x{tx_hash_hex}")
-        return {"tx_hash": f"0x{tx_hash_hex}", "status": "pending"}
+        print(f"[!] Timeout: {e}", file=sys.stderr)
+        print(f"[!] Check: https://bscscan.com/tx/{tx_hash_hex}")
+        return {"tx_hash": tx_hash_hex, "status": "pending"}
 
-    if receipt["status"] == 1:
-        print(f"[+] Transaction confirmed in block {receipt['blockNumber']}")
-        print(f"[+] Gas used: {receipt['gasUsed']}")
+    if receipt["status"] != 1:
+        print(f"[!] Transaction FAILED", file=sys.stderr)
+        return {"tx_hash": tx_hash_hex, "status": "failed"}
 
-        # Parse BoxOpened event to get orderId
-        order_id = None
-        try:
-            logs = contract.events.BoxOpened().process_receipt(receipt)
-            if logs:
-                order_id = logs[0]["args"]["orderId"].hex()
-                print(f"[+] Order ID: 0x{order_id}")
-        except Exception as e:
-            print(f"[!] Could not parse BoxOpened event: {e}")
+    print(f"[+] Confirmed in block {receipt['blockNumber']}, gas used: {receipt['gasUsed']}")
 
-        result = {
-            "tx_hash": f"0x{tx_hash_hex}",
-            "status": "success",
-            "block": receipt["blockNumber"],
-            "gas_used": receipt["gasUsed"],
-            "order_id": f"0x{order_id}" if order_id else None,
-            "tier": tier,
-            "price_bnb": str(price_bnb),
-        }
-
-        print(f"\n{'='*60}")
-        print(f"  BOX OPENED SUCCESSFULLY!")
-        print(f"{'='*60}")
-        print(f"  TX Hash   : {result['tx_hash']}")
-        print(f"  Order ID  : {result['order_id']}")
-        print(f"  Tier      : {tier}")
-        print(f"  Price     : {price_bnb} BNB")
-        print(f"{'='*60}")
-
-        # TODO: Call backend API to generate image
-        if api_url:
-            print(f"\n[+] Calling backend API to generate image...")
-            _call_generate_api(api_url, result)
-
-        return result
-    else:
-        print(f"\n[!] Transaction FAILED", file=sys.stderr)
-        print(f"[!] Check: https://bscscan.com/tx/0x{tx_hash_hex}")
-        return {"tx_hash": f"0x{tx_hash_hex}", "status": "failed"}
-
-
-def _call_generate_api(api_url, result):
-    """Call backend API to generate image after successful box opening.
-
-    API endpoint and payload format TBD.
-    """
+    # Parse BoxOpened event
+    order_id = None
     try:
-        import urllib.request
-        payload = json.dumps({
-            "tx_hash": result["tx_hash"],
-            "order_id": result["order_id"],
-            "tier": result["tier"],
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            api_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            print(f"[+] API response: {json.dumps(body, indent=2)}")
+        logs = contract.events.BoxOpened().process_receipt(receipt)
+        if logs:
+            order_id = f"0x{logs[0]['args']['orderId'].hex()}"
+            print(f"[+] Order ID: {order_id}")
     except Exception as e:
-        print(f"[!] API call failed (non-blocking): {e}", file=sys.stderr)
-        print(f"[!] You can retry manually with tx_hash: {result['tx_hash']}")
+        print(f"[!] Could not parse BoxOpened event: {e}")
+
+    # ========== Step 2: Verify tx & create order ==========
+    print(f"\n[Step 2/4] Processing order (verify tx, draw rarity)...")
+    order_resp = api_post(api_base, "/api/box/open", {
+        "walletAddress": sender,
+        "tier": tier,
+        "paymentMethod": "BNB",
+        "txHash": tx_hash_hex,
+        "cryptoAmount": float(price_bnb),
+    })
+
+    if not order_resp or not order_resp.get("success"):
+        print(f"[!] Order processing failed. TX was successful, retry with tx_hash: {tx_hash_hex}", file=sys.stderr)
+        return {"tx_hash": tx_hash_hex, "status": "tx_success_order_failed", "order_id": order_id}
+
+    order = order_resp["order"]
+    sbts = order_resp.get("sbts", [])
+    highest_rarity = order.get("highestRarity", "Unknown")
+    total_points = order.get("totalPoints", 0)
+    stats = order.get("stats", {})
+
+    print(f"[+] Rarity drawn: {highest_rarity}")
+    print(f"[+] Total points: {total_points}")
+    if stats:
+        print(f"[+] Breakdown: {', '.join(f'{k}: {v}' for k, v in stats.items())}")
+
+    sbt_id = sbts[0]["id"] if sbts else None
+
+    # ========== Step 3: Generate AI artwork ==========
+    print(f"\n[Step 3/4] Generating AI artwork (this may take a moment)...")
+    image_resp = api_post(api_base, "/api/generate-image", {
+        "rarity": highest_rarity,
+        "tier": tier,
+    }, timeout=180)
+
+    image_url = None
+    ipfs_uri = None
+    ipfs_cid = None
+    source_image_url = None
+    content_type = None
+    size_bytes = None
+
+    if image_resp and image_resp.get("success"):
+        data = image_resp["data"]
+        image_url = data.get("imageUrl")
+        ipfs_uri = data.get("ipfsUri")
+        ipfs_cid = data.get("ipfsCid")
+        source_image_url = data.get("sourceImageUrl")
+        content_type = data.get("contentType")
+        size_bytes = data.get("sizeBytes")
+        print(f"[+] Image generated!")
+        print(f"[+] IPFS: {ipfs_uri}")
+        print(f"[+] URL: {image_url}")
+    else:
+        print(f"[!] Image generation failed (non-blocking)", file=sys.stderr)
+
+    # ========== Step 4: Bind image to SBT ==========
+    if sbt_id and image_url:
+        print(f"\n[Step 4/4] Binding image to SBT...")
+        update_payload = {
+            "sbtId": sbt_id,
+            "imageUrl": image_url,
+        }
+        if ipfs_uri:
+            update_payload["ipfsUri"] = ipfs_uri
+        if source_image_url:
+            update_payload["sourceImageUrl"] = source_image_url
+        if ipfs_cid:
+            update_payload["ipfsCid"] = ipfs_cid
+        if content_type:
+            update_payload["contentType"] = content_type
+        if size_bytes:
+            update_payload["sizeBytes"] = size_bytes
+
+        sbt_resp = api_post(api_base, "/api/sbt/update-image", update_payload)
+        if sbt_resp and sbt_resp.get("success"):
+            print(f"[+] SBT image bound successfully!")
+        else:
+            print(f"[!] SBT image binding failed (non-blocking)", file=sys.stderr)
+    else:
+        print(f"\n[Step 4/4] Skipped (no SBT or no image)")
+
+    # ========== Result ==========
+    result = {
+        "tx_hash": tx_hash_hex,
+        "status": "success",
+        "order_id": order_id,
+        "tier": tier,
+        "price_bnb": str(price_bnb),
+        "highest_rarity": highest_rarity,
+        "total_points": total_points,
+        "rarity_stats": stats,
+        "image_url": image_url,
+        "ipfs_uri": ipfs_uri,
+        "sbt_id": sbt_id,
+    }
+
+    print(f"\n{'='*60}")
+    print(f"  BOX OPENED SUCCESSFULLY!")
+    print(f"{'='*60}")
+    print(f"  TX Hash   : {tx_hash_hex}")
+    print(f"  Order ID  : {order_id}")
+    print(f"  Tier      : {tier} box(es)")
+    print(f"  Price     : {price_bnb} BNB")
+    print(f"  Rarity    : {highest_rarity}")
+    print(f"  Points    : {total_points}")
+    if image_url:
+        print(f"  Image     : {image_url}")
+    if ipfs_uri:
+        print(f"  IPFS      : {ipfs_uri}")
+    print(f"  BSCScan   : https://bscscan.com/tx/{tx_hash_hex}")
+    print(f"{'='*60}")
+
+    # Output JSON for programmatic use
+    print(f"\n[JSON] {json.dumps(result)}")
+    return result
 
 
 def main():
@@ -289,18 +347,18 @@ def main():
                         help="Number of boxes to open (1, 10, 100, 1000, 10000)")
     parser.add_argument("--contract", default=DEFAULT_CONTRACT,
                         help=f"PANdoraBox contract address (default: {DEFAULT_CONTRACT})")
+    parser.add_argument("--api-base", default=DEFAULT_API_BASE,
+                        help=f"Backend API base URL (default: {DEFAULT_API_BASE})")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate transaction without broadcasting")
-    parser.add_argument("--api-url", default=None,
-                        help="Backend API URL for image generation (optional)")
     args = parser.parse_args()
 
     open_box(
         private_key=args.private_key,
         tier=args.tier,
         contract_address=args.contract,
+        api_base=args.api_base,
         dry_run=args.dry_run,
-        api_url=args.api_url,
     )
 
 
