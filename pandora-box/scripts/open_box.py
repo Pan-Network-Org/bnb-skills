@@ -21,7 +21,9 @@ Tiers:
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -122,6 +124,30 @@ def api_post(base_url, path, payload, timeout=120):
         return None
     except Exception as e:
         print(f"[!] API request failed on {path}: {e}", file=sys.stderr)
+        return None
+
+
+def download_image(url, prefix="pandora_box_"):
+    """Download image from URL to a temp file. Returns local file path or None."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "PANdoraBox-Skill/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if "webp" in content_type:
+                ext = ".webp"
+            elif "png" in content_type:
+                ext = ".png"
+            elif "gif" in content_type:
+                ext = ".gif"
+            else:
+                ext = ".jpg"
+            fd, path = tempfile.mkstemp(suffix=ext, prefix=prefix)
+            with os.fdopen(fd, "wb") as f:
+                f.write(resp.read())
+            print(f"[+] Image downloaded: {path}")
+            return path
+    except Exception as e:
+        print(f"[!] Image download failed: {e}", file=sys.stderr)
         return None
 
 
@@ -264,6 +290,8 @@ def open_box(private_key, tier, contract_address, api_base, dry_run=False):
     content_type = None
     size_bytes = None
 
+    image_local_path = None
+
     if image_resp and image_resp.get("success"):
         data = image_resp["data"]
         image_url = data.get("imageUrl")
@@ -275,6 +303,10 @@ def open_box(private_key, tier, contract_address, api_base, dry_run=False):
         print(f"[+] Image generated!")
         print(f"[+] IPFS: {ipfs_uri}")
         print(f"[+] URL: {image_url}")
+
+        # Download image locally
+        print(f"[+] Downloading image...")
+        image_local_path = download_image(image_url)
     else:
         print(f"[!] Image generation failed (non-blocking)", file=sys.stderr)
 
@@ -315,6 +347,7 @@ def open_box(private_key, tier, contract_address, api_base, dry_run=False):
         "total_points": total_points,
         "rarity_stats": stats,
         "image_url": image_url,
+        "image_local_path": image_local_path,
         "ipfs_uri": ipfs_uri,
         "sbt_id": sbt_id,
     }
@@ -328,8 +361,10 @@ def open_box(private_key, tier, contract_address, api_base, dry_run=False):
     print(f"  Price     : {price_bnb} BNB")
     print(f"  Rarity    : {highest_rarity}")
     print(f"  Points    : {total_points}")
-    if image_url:
-        print(f"  Image     : {image_url}")
+    if image_local_path:
+        print(f"  Image     : {image_local_path}")
+    elif image_url:
+        print(f"  Image URL : {image_url}")
     if ipfs_uri:
         print(f"  IPFS      : {ipfs_uri}")
     print(f"  BSCScan   : https://bscscan.com/tx/{tx_hash_hex}")
